@@ -1,16 +1,22 @@
 """This module contains the business logic of the function.
 
-Use the automation_context module to wrap your function in an Autamate context helper
+use the automation_context module to wrap your function in an Autamate context helper
 """
 
-from pydantic import Field, SecretStr
+import numpy as np
+from pydantic import Field
 from speckle_automate import (
     AutomateBase,
     AutomationContext,
     execute_automate_function,
 )
+from specklepy.objects.other import Collection
+from specklepy.objects.units import Units
 
-from flatten import flatten_base
+from utils.utils_osm import get_base_plane, get_buildings, get_nature, get_roads
+from utils.utils_other import RESULT_BRANCH
+from utils.utils_png import create_image_from_bbox
+from utils.utils_server import get_commit_data, query_units_info, query_version_info
 
 
 class FunctionInputs(AutomateBase):
@@ -21,13 +27,27 @@ class FunctionInputs(AutomateBase):
     https://docs.pydantic.dev/latest/usage/models/
     """
 
-    # an example how to use secret values
-    whisper_message: SecretStr = Field(title="This is a secret message")
-    forbidden_speckle_type: str = Field(
-        title="Forbidden speckle type",
+    radius_in_meters: float = Field(
+        title="Radius in meters",
+        ge=50,
+        le=1000,
         description=(
-            "If a object has the following speckle_type,"
-            " it will be marked with an error."
+            "Radius from the Model location," " derived from Revit model lat, lon."
+        ),
+    )
+
+    latitude: float = Field(
+        title="Latitude in degrees",
+    )
+
+    longitude: float = Field(
+        title="Longitude in degrees",
+    )
+
+    generate_image: bool = Field(
+        title="Generate a 2d map",
+        description=(
+            "Enable or disable generation of 2d map, in addition to the 3d model"
         ),
     )
 
@@ -46,40 +66,115 @@ def automate_function(
         function_inputs: An instance object matching the defined schema.
     """
     # the context provides a conveniet way, to receive the triggering version
-    version_root_object = automate_context.receive_version()
+    try:
+        project = get_commit_data(automate_context)
+        projInfo = query_version_info(automate_context, project)
+        #lon = np.rad2deg(projInfo["longitude"])
+        #lat = np.rad2deg(projInfo["latitude"])
 
-    objects_with_forbidden_speckle_type = [
-        b
-        for b in flatten_base(version_root_object)
-        if b.speckle_type == function_inputs.forbidden_speckle_type
-    ]
-    count = len(objects_with_forbidden_speckle_type)
+        lon = function_inputs.longitude
+        lat = function_inputs.latitude
 
-    if count > 0:
-        # this is how a run is marked with a failure cause
-        automate_context.attach_error_to_objects(
-            category="Forbidden speckle_type"
-            f" ({function_inputs.forbidden_speckle_type})",
-            object_ids=[o.id for o in objects_with_forbidden_speckle_type if o.id],
-            message="This project should not contain the type: "
-            f"{function_inputs.forbidden_speckle_type}",
+        try:
+            angle_rad = projInfo["locations"][0]["trueNorth"]
+        except:
+            angle_rad = 0
+
+        # get units conversion factor
+        project_units = query_units_info(automate_context, project)
+
+        # get OSM buildings and roads in given area
+        base_plane = get_base_plane(
+            lat, lon, function_inputs.radius_in_meters, project_units
         )
-        automate_context.mark_run_failed(
-            "Automation failed: "
-            f"Found {count} object that have one of the forbidden speckle types: "
-            f"{function_inputs.forbidden_speckle_type}"
+        building_base_objects = get_buildings(
+            lat, lon, function_inputs.radius_in_meters, angle_rad, project_units
+        )
+        roads_lines, roads_meshes = get_roads(
+            lat, lon, function_inputs.radius_in_meters, angle_rad, project_units
+        )
+        nature_base_objects = get_nature(
+            lat, lon, function_inputs.radius_in_meters, angle_rad, project_units
         )
 
-        # set the automation context view, to the original model / version view
-        # to show the offending objects
-        automate_context.set_context_view()
+        # create layers for buildings and roads
+        building_layer = Collection(
+            elements=building_base_objects,
+            units=project_units,
+            latitude=lat,
+            longitude=lon,
+            trueNorth=angle_rad,
+            name="Context: Buildings",
+            collectionType="BuildingsMeshesLayer",
+            sourceData="© OpenStreetMap",
+            sourceUrl="https://www.openstreetmap.org/",
+        )
+        r"""
+        roads_line_layer = Collection(
+            elements=roads_lines,
+            units="m",
+            latitude=lat,
+            longitude=lon,
+            trueNorth=angle_rad,
+            name="Context: Roads (Polylines)",
+            collectionType="RoadPolyinesLayer",
+            sourceData="© OpenStreetMap",
+            sourceUrl="https://www.openstreetmap.org/",
+        )
+        """
+        roads_mesh_layer = Collection(
+            elements=roads_meshes,
+            units=project_units,
+            latitude=lat,
+            longitude=lon,
+            trueNorth=angle_rad,
+            name="Context: Roads (Meshes)",
+            collectionType="RoadMeshesLayer",
+            sourceData="© OpenStreetMap",
+            sourceUrl="https://www.openstreetmap.org/",
+        )
+        nature_layer = Collection(
+            elements=nature_base_objects,
+            units=project_units,
+            latitude=lat,
+            longitude=lon,
+            trueNorth=angle_rad,
+            name="Context: Nature",
+            collectionType="NatureMeshesLayer",
+            sourceData="© OpenStreetMap",
+            sourceUrl="https://www.openstreetmap.org/",
+        )
 
-    else:
-        automate_context.mark_run_success("No forbidden types found.")
+        # add layers to a commit Collection object
+        commit_obj = Collection(
+            elements=[base_plane, building_layer, roads_mesh_layer, nature_layer],
+            units=project_units,
+            latitude=lat,
+            longitude=lon,
+            trueNorth=angle_rad,
+            name="Context",
+            collectionType="ContextLayer",
+            sourceData="© OpenStreetMap",
+            sourceUrl="https://www.openstreetmap.org/",
+        )
 
-    # if the function generates file results, this is how it can be
-    # attached to the Speckle project / model
-    # automate_context.store_file_result("./report.pdf")
+        # create a commit
+        new_model_id, new_version_id = automate_context.create_new_version_in_project(
+            commit_obj, RESULT_BRANCH, "Context from Automate"
+        )
+        automate_context.set_context_view([f"{new_model_id}@{new_version_id}"], True)
+
+        if function_inputs.generate_image is True:
+            # create and add a basemap png file
+            path = create_image_from_bbox(lat, lon, function_inputs.radius_in_meters)
+            automate_context.store_file_result(path)
+
+        # automate_context.set_context_view(
+        #    resource_ids=[automate_context.automation_run_data.model_id, new_model_id]
+        # )
+        automate_context.mark_run_success("Created 3D context")
+    except Exception as ex:
+        automate_context.mark_run_failed(f"Failed to create 3d context cause: {ex}")
 
 
 def automate_function_without_inputs(automate_context: AutomationContext) -> None:
