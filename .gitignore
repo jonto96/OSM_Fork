@@ -313,3 +313,5 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,pycharm
+/.vs/OSM_Fork/FileContentIndex/21e2df05-4ebb-4ecd-a675-9a0d45f97b73.vsidx
+/.vs/OSM_Fork/FileContentIndex
