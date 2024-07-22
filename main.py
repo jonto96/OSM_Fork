@@ -3,7 +3,6 @@
 use the automation_context module to wrap your function in an Autamate context helper
 """
 
-import numpy as np
 from pydantic import Field
 from speckle_automate import (
     AutomateBase,
